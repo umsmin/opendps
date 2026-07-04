@@ -146,6 +146,13 @@ class tty_interface(comm_interface):
             self._port_handle.baudrate = baudrate
         self._baudrate = baudrate
 
+    def set_timeout(self, timeout):
+        if self._port_handle:
+            self._port_handle.timeout = timeout
+
+    def baudrate(self):
+        return self._baudrate
+
 
 class tcp_interface(comm_interface):
     """
@@ -654,9 +661,21 @@ def run_upgrade(comms, fw_file_name, args):
         # Switch to faster baud if requested
         if upgrade_baud and upgrade_baud != 9600 and isinstance(comms, tty_interface):
             print("Switching bootloader to {:d} baud for data transfer...".format(upgrade_baud))
-            communicate(comms, create_set_baud(upgrade_baud), args, quiet=True)
-            time.sleep(0.1)  # Let bootloader switch before we do
+            # The bootloader may switch baud before the last byte of its ack
+            # has fully left the UART, garbling the response. Send the command
+            # blindly, discard whatever comes back and switch our end too.
+            comms.write(create_set_baud(upgrade_baud).get_frame())
+            time.sleep(0.2)  # Let the (possibly garbled) ack drain and the bootloader switch
+            comms.read()  # Discard it
             comms.set_baudrate(upgrade_baud)
+
+        # A chunk can take longer to transfer than the default serial timeout
+        # (a 1024 byte chunk at 9600 baud takes over a second on the wire and
+        # the device cannot ack until it has received all of it). Extend the
+        # timeout to cover the worst case transfer time: 10 bits per byte and
+        # up to 2x frame size due to escaping, plus a flash write margin.
+        if isinstance(comms, tty_interface):
+            comms.set_timeout(2.0 + (20.0 * chunk_size) / comms.baudrate())
 
         counter = 0
         for chunk in chunk_from_file(fw_file_name, chunk_size):
