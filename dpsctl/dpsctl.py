@@ -146,6 +146,13 @@ class tty_interface(comm_interface):
             self._port_handle.baudrate = baudrate
         self._baudrate = baudrate
 
+    def set_timeout(self, timeout):
+        if self._port_handle:
+            self._port_handle.timeout = timeout
+
+    def baudrate(self):
+        return self._baudrate
+
 
 class tcp_interface(comm_interface):
     """
@@ -497,6 +504,9 @@ def handle_commands(args):
         uhej_scan()
         return
 
+    if args.calibration_step is not None and not args.calibrate:
+        fail("--step requires -C/--calibrate")
+
     comms = create_comms(args)
 
     if args.ping:
@@ -654,9 +664,21 @@ def run_upgrade(comms, fw_file_name, args):
         # Switch to faster baud if requested
         if upgrade_baud and upgrade_baud != 9600 and isinstance(comms, tty_interface):
             print("Switching bootloader to {:d} baud for data transfer...".format(upgrade_baud))
-            communicate(comms, create_set_baud(upgrade_baud), args, quiet=True)
-            time.sleep(0.1)  # Let bootloader switch before we do
+            # The bootloader may switch baud before the last byte of its ack
+            # has fully left the UART, garbling the response. Send the command
+            # blindly, discard whatever comes back and switch our end too.
+            comms.write(create_set_baud(upgrade_baud).get_frame())
+            time.sleep(0.2)  # Let the (possibly garbled) ack drain and the bootloader switch
+            comms.read()  # Discard it
             comms.set_baudrate(upgrade_baud)
+
+        # A chunk can take longer to transfer than the default serial timeout
+        # (a 1024 byte chunk at 9600 baud takes over a second on the wire and
+        # the device cannot ack until it has received all of it). Extend the
+        # timeout to cover the worst case transfer time: 10 bits per byte and
+        # up to 2x frame size due to escaping, plus a flash write margin.
+        if isinstance(comms, tty_interface):
+            comms.set_timeout(2.0 + (20.0 * chunk_size) / comms.baudrate())
 
         counter = 0
         for chunk in chunk_from_file(fw_file_name, chunk_size):
@@ -745,14 +767,21 @@ def create_comms(args):
 
 def do_calibration(comms, args):
     """
-    Run DPS calibration prompts
+    Run DPS calibration prompts.
+    If args.calibration_step is set, only that step is run:
+      1: input voltage, 2: output voltage, 3: output current
     """
+    step = args.calibration_step
+
     print("For calibration you will need:")
     print("\tA multimeter")
     print("\tA known load capable of handling the required power")
     print("\tA thick wire for shorting the output of the DPS")
     print("\t2 stable input voltages\r\n")
     print("Please ensure nothing is connected to the output of the DPS before starting calibration!\r\n")
+    if step is not None:
+        step_names = {1: "Input Voltage Calibration", 2: "Output Voltage Calibration", 3: "Output Current Calibration"}
+        print("Running step {:d} ({}) only\r\n".format(step, step_names[step]))
 
     t = input("Would you like to proceed? (y/n): ")
     if t.lower() != 'y':
@@ -761,6 +790,35 @@ def do_calibration(comms, args):
     # Change to the settings screen
     communicate(comms, create_change_screen(protocol.CHANGE_SCREEN_SETTINGS), args, quiet=True)
 
+    if step is None:
+        input_voltage_mv = calibrate_input_voltage(comms, args)
+        v_dac_k, v_dac_c, v_adc_k, v_adc_c = calibrate_output_voltage(comms, args)
+        calibrate_output_current(comms, args, input_voltage_mv, v_dac_k, v_dac_c, v_adc_k)
+    elif step == 1:
+        calibrate_input_voltage(comms, args)
+    elif step == 2:
+        calibrate_output_voltage(comms, args)
+    elif step == 3:
+        # The current calibration relies on values normally produced by steps
+        # 1 and 2, so fetch them from the calibration stored on the device
+        data = communicate(comms, create_cmd(protocol.CMD_CAL_REPORT), args, quiet=True)
+        cal = data['cal']
+        input_voltage_mv = get_average_calibration_result(comms, 'vin_adc') * float(cal['VIN_ADC_K']) + float(cal['VIN_ADC_C'])
+        print("Using stored voltage calibration, detected input voltage: {:.0f} mV".format(input_voltage_mv))
+        calibrate_output_current(comms, args, input_voltage_mv, float(cal['V_DAC_K']), float(cal['V_DAC_C']), float(cal['V_ADC_K']))
+
+    # Change to the main screen
+    communicate(comms, create_change_screen(protocol.CHANGE_SCREEN_MAIN), args, quiet=True)
+
+    print("\r\nCalibration Complete!\r\n")
+    print("To restore the device to the OpenDPS defaults use dpsctl.py --calibration_reset")
+
+
+def calibrate_input_voltage(comms, args):
+    """
+    Calibration step 1: input voltage calibration.
+    Returns the higher of the two input voltages in mV.
+    """
     print("\r\nInput Voltage Calibration:")
     calibration_input_voltage = []
     calibration_vin_adc = []
@@ -806,6 +864,14 @@ def do_calibration(comms, args):
         plt.axis(xmin=0, ymin=0)
         plt.show()
 
+    return calibration_input_voltage[1]
+
+
+def calibrate_output_voltage(comms, args):
+    """
+    Calibration step 2: output voltage calibration.
+    Returns the V_DAC and V_ADC coefficients (v_dac_k, v_dac_c, v_adc_k, v_adc_c).
+    """
     print("\r\nOutput Voltage Calibration:")
     print("Finding maximum output V_DAC value", end='')
 
@@ -933,13 +999,21 @@ def do_calibration(comms, args):
         plt.axis(xmin=0, ymin=0)
         plt.show()
 
+    return v_dac_k, v_dac_c, v_adc_k, v_adc_c
+
+
+def calibrate_output_current(comms, args, input_voltage_mv, v_dac_k, v_dac_c, v_adc_k):
+    """
+    Calibration step 3: output current calibration (A_ADC) followed by
+    constant current calibration (A_DAC).
+    """
     print("\r\nOutput Current Calibration:")
     max_dps_current = float(input("Max output current of your DPS (e.g 5 for the DPS5005) in amps: "))
     load_resistance = float(input("Load resistance in ohms: "))
     load_max_wattage = float(input("Load wattage rating in watts: "))
 
     # There are three potential limiting factors for the output voltage, these are:
-    output_voltage_based_on_input_voltage_mv = calibration_input_voltage[1] * 0.9  # 90% of input voltage
+    output_voltage_based_on_input_voltage_mv = input_voltage_mv * 0.9  # 90% of input voltage
     output_voltage_based_on_max_wattage_of_load_mv = math.sqrt(load_max_wattage * load_resistance) * 1000  # Maximum supported voltage of the load V = Sqrt(W x R)
     output_voltage_based_on_max_output_current_mv = max_dps_current * load_resistance * 1000  # V = I x R
 
@@ -1112,12 +1186,6 @@ def do_calibration(comms, args):
         plt.axis(xmin=0, ymin=0)
         plt.show()
 
-    # Change to the main screen
-    communicate(comms, create_change_screen(protocol.CHANGE_SCREEN_MAIN), args, quiet=True)
-
-    print("\r\nCalibration Complete!\r\n")
-    print("To restore the device to the OpenDPS defaults use dpsctl.py --calibration_reset")
-
 
 def uhej_worker_thread():
     """
@@ -1205,7 +1273,7 @@ def main():
     testing = '--testing' in sys.argv
     parser = argparse.ArgumentParser(description='Instrument an OpenDPS device')
 
-    parser.add_argument('-d', '--device', help="OpenDPS device to connect to. Can be a /dev/tty device, IP address for UDP protocol or tcp:IP for TCP protocol. If omitted, dpsctl.py will try the environment variable DPSIF", default=os.getenv('DPSCTL_DEVICE'))
+    parser.add_argument('-d', '--device', help="OpenDPS device to connect to. Can be a /dev/tty device, IP address for UDP protocol or tcp:IP for TCP protocol. If omitted, dpsctl.py will try the environment variable DPSIF", default='')
     parser.add_argument('-b', '--baudrate', type=int, dest="baudrate", help="Set baudrate used for serial communications", default=9600)
     parser.add_argument('-B', '--brightness', type=int, help="Set display brightness (0..100)")
     parser.add_argument('--set-baud', type=int, dest="set_baud", default=None,
@@ -1218,6 +1286,8 @@ def main():
     parser.add_argument('-p', '--parameter', nargs='+', help="Set function parameter <name>=<value>")
     parser.add_argument('-P', '--list-parameters', action='store_true', help="List function parameters of active function")
     parser.add_argument('-C', '--calibrate', action="store_true", help="Starts System Calibration Routine")
+    parser.add_argument('--step', type=int, dest="calibration_step", default=None, choices=[1, 2, 3],
+                        help="Run only the given calibration step with -C (1: input voltage, 2: output voltage, 3: output current). The remaining steps are not run")
     parser.add_argument('-c', '--calibration_set', nargs='+', help="Set the specified calibration coefficient <name>=<value>")
     parser.add_argument('-cr', '--calibration_report', action="store_true", help="Prints Calibration report")
     parser.add_argument('--calibration_reset', action='store_true', help="Resets the calibration to the default values")
